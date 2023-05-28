@@ -20,6 +20,7 @@ JST = datetime.timezone(datetime.timedelta(hours=+DIFF_JST_FROM_UTC), 'JST')
 
 # 受け取りメッセージ
 GO_HOME = ["go-home", "退勤", "たいきん"]
+LIST_MESSAGE = ["list", "リスト"]
 
 # 返答メッセージ
 TAIKIN_MESSAGE_OK = "今日もおつかれさま！！"
@@ -123,7 +124,27 @@ def edit_userFile(userID, dt_now):
         return "今日もおつかれさま！！"
     
     except Exception as e:
-        return "エラーが発生しました : " + str(e)    
+        return "エラーが発生しました : " + str(e)
+
+def get_list(userID):
+        logger.info('get taikin list')
+        # 退勤時間記入JSONファイル取得
+        s3_client_taikin = s3_client.get_object(
+            Bucket = BUCKET_NAME,
+            Key = userID + ".json"
+        )
+        kadou = json.loads(s3_client_taikin['Body'].read())
+        logger.info("kadou time -> " + str(kadou))
+
+        message = "今月の退勤時間は"
+
+        for time_res in kadou.keys():
+            if time_res != "user":
+                message = message + "\n" + time_res + ":" + str(kadou[time_res]["TaikinTime"])
+
+        message = message + "\nだよー"
+
+        return message
 
 # ---------------------------
 #  ファイル存在チェック
@@ -200,6 +221,18 @@ def lambda_handler(event, context):
 
         # ユーザーファイル編集
         reply = edit_userFile(userID, dt_now)
+    
+    elif message in LIST_MESSAGE:
+        # S3バケット内にユーザーファイルが存在するかチェック
+        check_file_result = check_file(s3_client, userID)
+
+         # ユーザーファイル無 -> エラー
+        if check_file_result == False:
+            reply = "たいきん登録がないよ😭"
+
+        # ユーザーファイル出力
+        reply = get_list(userID)
+            
 
     else:
         reply = TAIKIN_MESSAGE_NG
