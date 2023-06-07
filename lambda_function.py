@@ -26,7 +26,7 @@ JST = datetime.timezone(datetime.timedelta(hours=+DIFF_JST_FROM_UTC), 'JST')
 GO_HOME = ["go-home", "退勤", "たいきん"]
 LIST_MESSAGE = ["list", "リスト"]
 RESET_MESSAGE = ["りせっと"]
-ETC_MESSAGE = ["その他"]
+ETC_MESSAGE = ["その他", "そのた"]
 
 # 返答メッセージ
 TAIKIN_MESSAGE_OK = "今日もおつかれさま！！"
@@ -219,13 +219,14 @@ def reset_file(s3_client, userID):
     copy_to_path = "list-backup/" + userID + ".json"
     copy_from_path = userID + ".json"
 
+    logger.info("S3ファイルリセットします")
     try:
         # list-backupフォルダへリストを移動
         s3_client.copy_object(Bucket=BUCKET_NAME, 
                               Key=copy_to_path, 
                               CopySource={'Bucket': BUCKET_NAME, 'Key': copy_from_path}
                               )
-        
+        logger.info("S3ファイルリセット完了")
         return "ファイルリセットしたよ"
 
     except Exception as e:
@@ -242,29 +243,25 @@ def fix_setting(s3_client, userID, message):
 
     # 修正後時間
     fix_time = {}
-    i = 1
+    i = 0
 
     # リストループ[99:99〜99:99]
     for ls in list_fix_time:
-        # 時間を「〜」でリスト化[99:99,99:99]
-        list_fix_res = ls.split("~")
-        if len(list_fix_res) != 2:
-            logger.info('入力形式エラー -> ' + str(list_fix_res))
-            return "99:99〜99:99形式じゃないよ！" + str(list_fix_res)
-        # 99:99
-        for ls_time in list_fix_res:
-            if re.match("\d\d:\d\d", ls_time) is None:
-                logger.info('入力文字エラー -> ' + ls_time)
-                return "入力文字に問題アリ！" + ls_time
-        # エラーなければdict化
-        add_body = {    
-                        "res" + i:
-                        {
-                            "res_s": list_fix_res[0],
-                            "res_e": list_fix_res[1]
+        if i > 0:
+            if re.match("\d\d:\d\d〜\d\d:\d\d", ls) is None:
+                logger.info('入力形式エラー -> ' + str(ls))
+                return "99:99〜99:99形式じゃないよ！" + str(ls)
+            # エラーなければdict化
+            wk_time = ls
+            add_body = {    
+                            "res" + str(i):
+                            {
+                                "res_s": wk_time[:5],
+                                "res_e": wk_time[6:]
+                            }
                         }
-                    }
-        fix_time = dict(fix_time, **add_body)
+            fix_time = dict(fix_time, **add_body)
+
         i = i + 1
 
     # 休憩時間設定ファイル更新
@@ -288,7 +285,7 @@ def send_line(userID, message, reply_token):
     logger.info("--- 個別メッセージ配信完了 ---")
 
 def send_template(message_template, reply_token):
-    logger.info("--- テンプレメッセージ配信：" + message_template + " ---")
+    logger.info("--- テンプレメッセージ配信：" + str(message_template) + " ---")
     line_bot_api.reply_message(reply_token, message_template)
     logger.info("--- テンプレメッセージ配信完了 ---")
 
@@ -377,14 +374,17 @@ def lambda_handler(event, context):
 
     # シグネチャー
     signature = event['headers']['x-line-signature']
+    logger.info(signature)
 
     body = event['body']
+    logger.info(body)
 
     # ---------------
     #  通常応答
     # ---------------
     @handler.add(MessageEvent, message=TextMessage)
     def on_message(line_event):
+        logger.info(line_event.message.text)
         # リクエスト読み込み
         userID = json.loads(event['body'])['events'][0]['source']['userId']
         message = json.loads(event['body'])['events'][0]['message']['text']
@@ -406,6 +406,9 @@ def lambda_handler(event, context):
 
             # ユーザーファイル編集
             reply = edit_userFile(userID, dt_now)
+
+            send_line(userID, reply, reply_token)
+            return 0
         
         elif message in LIST_MESSAGE:
             # S3バケット内にユーザーファイルが存在するかチェック
@@ -420,15 +423,16 @@ def lambda_handler(event, context):
             # ユーザーファイル出力
             reply = get_list(userID)
             send_line(userID, reply, reply_token)
+            return 0
         
-        elif message == ETC_MESSAGE:
+        elif message in ETC_MESSAGE:
             reply = reply_template(0)
-            send_template(reply)
+            send_template(reply, reply_token)
             return 0
         
         # 休憩時間修正
         elif message[:4] == "休憩時間":
-            reply = fix_setting(s3_client, userID)
+            reply = fix_setting(s3_client, userID, message)
             send_line(userID, reply, reply_token)
             return 0
         
@@ -492,6 +496,6 @@ def lambda_handler(event, context):
             send_line(userID, reply, reply_token)
             return 0
         
-        handler.handle(body, signature)
-        return 0
+    handler.handle(body, signature)
+    return 0
 
