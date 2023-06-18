@@ -49,9 +49,6 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 # LINE ハンドラー
 handler = WebhookHandler(CHANNEL_SECRET)
 
-#　月MAX稼働時間
-MAX_KADOU_TIME = 180
-
 # ================================
 #  S3
 # ================================
@@ -83,7 +80,7 @@ def edit_userFile(userID, dt_now):
                 Key = "time/" + userID + "_conf.json"
             )
         setting = json.loads(s3_client_setting['Body'].read())
-        work_time = datetime.datetime.strptime(setting[work_time], '%H:%M')
+        work_time = datetime.datetime.strptime(setting['work_time'], '%H:%M')
 
         total_res = datetime.datetime.strptime("00:00", '%H:%M')
         taikin_time = dt_now.strftime("%H:%M")
@@ -91,46 +88,16 @@ def edit_userFile(userID, dt_now):
 
         # 退勤時間から総休憩時間を計算
         logger.info('clac kadou time')
-        for time_res in dic_res.values():
 
-            time_res_s_date = datetime.datetime.strptime(time_res['res_s'], '%H:%M')
-            time_res_e_date = datetime.datetime.strptime(time_res['res_e'], '%H:%M')
-            if taikin_time_date >= time_res_e_date:
-                res_time_delta = time_res_e_date - time_res_s_date
-                total_res = total_res + res_time_delta
-                logger.info('res total -> ' + total_res.strftime('%H:%M'))
+        # 休憩時間計算
+        add_body = kadou_time_calc(dt_now, taikin_time, dic_res, setting)
+        if add_body == 9:
+            return "エラー発生🥲"
+        
+        logger.info('add_body -> ' + str(add_body))
+        logger.info(type(add_body))
 
-        # 始業時間セット（9:00固定）
-        shigyo_time = datetime.datetime.strptime("09:00", '%H:%M')
-
-        # 稼働時間計算（退勤時間 - 始業時間）
-        kadou_time_delta = taikin_time_date - shigyo_time
-
-        # 休憩時間をtimedelta型へ変換
-        total_res_delta = total_res - datetime.datetime.strptime("00:00", '%H:%M')
-
-        # 総稼働時間を計算（timedelta型 -> 秒数 -> int型）
-        kadou_time = int(kadou_time_delta.total_seconds() - total_res_delta.total_seconds())
-
-        # 総稼働時間を計算（秒数 -> 時間:分）
-        kadou_time_hour, remainder = divmod(kadou_time, 3600)
-        kadou_time_min, sec = divmod(remainder, 60)
-        kadou_time_time = datetime.time(hour = kadou_time_hour, minute = kadou_time_min)
-
-        #定時時間より計算時間が小さかったら定時時間にする（同時間かつ分が定時に満たない場合 ※半休考慮）
-        if kadou_time_hour == work_time.hour and kadou_time_min <= work_time.minute:
-            kadou_time_time = work_time
-
-        kadou_total = kadou_time_time.strftime('%H:%M')
-
-        # 退勤時間JSON上書き
-        add_body = {
-            dt_now.strftime("%Y-%m-%d"):
-                {
-                    "TaikinTime": taikin_time,
-                    "TotalTime": kadou_total
-                }
-        }
+        # 稼働時間ファイル更新
         body_text = dict(kadou, **add_body)
 
         # 読み込んだJSONファイルに追記
@@ -149,6 +116,71 @@ def edit_userFile(userID, dt_now):
         return "エラーが発生しました : " + str(e)
 
 # ---------------------------
+#  退勤時間修正
+# ---------------------------
+def fix_taikinTime(s3_client, userID, message, dt_now):
+    logger.info("退勤時間修正")
+
+    # 入力文字列チェック
+    #yyyy/mm/dd HH:MM
+    if re.match("\d{4}/\d{2}/\d{2}", message[4:14]) is None \
+        or re.match("\d\d:\d\d", message[15:]) is None:
+            return "「退勤修正YYYY/MM/DD HH:MM」で入力してね！ -> " + str(message) 
+    
+    # 修正する日付 (YYYY-mm-dd)
+    fix_date = message[4:14].replace('/','-')
+    fix_date = datetime.datetime.strptime(fix_date, '%Y-%m-%d')
+    logger.info("fix_date -> " + str(fix_date))
+    # 修正後の時間
+    fix_time = message[15:]
+    logger.info("fix_time -> " + str(fix_time))
+
+    # 勤怠ファイル取得
+    s3_client_kadou = s3_client.get_object(
+            Bucket = BUCKET_NAME,
+            Key = userID + ".json"
+        )
+    kadou = json.loads(s3_client_kadou['Body'].read())
+
+    # 設定ファイル取得
+    s3_client_setting = s3_client.get_object(
+            Bucket = BUCKET_NAME,
+            Key = "time/" + userID + "_conf.json"
+        )
+    setting = json.loads(s3_client_setting['Body'].read())
+
+    # 稼働・休憩時間のJSONファイル取得
+    s3_object_res = s3_client.get_object(
+        Bucket = BUCKET_NAME,
+        Key = "time/" + userID + "_res.json"
+    )
+
+    # 休憩時間をdict化
+    time_res_setting = json.loads(s3_object_res['Body'].read())
+
+    # 休憩時間計算
+    add_body = kadou_time_calc(fix_date, fix_time, time_res_setting, setting)
+    if add_body == 9:
+        return "エラー発生🥲"
+    
+    logger.info('add_body -> ' + str(add_body))
+    logger.info(type(add_body))
+
+    # 稼働時間ファイル更新
+    body_text = dict(kadou, **add_body)
+    logger.info("update file -> userId: " + str(userID) + "body: " + str(body_text))
+
+    #ファイルの更新
+    s3_client.put_object(
+        Bucket = BUCKET_NAME,
+        Key = userID + ".json",
+        Body = json.dumps(body_text)
+    )
+
+    return "稼働時間あっぷでーと🙆‍♀️"
+
+
+# ---------------------------
 #  退勤リスト作成
 # ---------------------------
 def get_list(userID):
@@ -165,11 +197,9 @@ def get_list(userID):
 
         for time_res in kadou.keys():
             if time_res != "user":
-                message = message + "\n" + time_res + ":" + str(kadou[time_res]["TaikinTime"])
-                total_time = str(kadou[time_res]["TotalTime"])
+                message = message + "\n" + time_res + " " + str(kadou[time_res]["TaikinTime"])
 
         message = message + "\nだよー"
-        message = message + "\n合計稼働時間は" + total_time + "\nだよー"
 
         return message
 
@@ -222,8 +252,9 @@ def calc_ZangyoTime(s3_client, userID):
                     total_time_sum = str(total_time_sum_h).zfill(2) + ":" + str(total_time_sum_m).zfill(2)
                     logger.info("total_time_sum -> " + total_time_sum)
                     # 総残業時間
-                    over_time = total_time - work_time
-                    over_time_sum = over_time_sum + over_time
+                    if total_time > work_time:
+                        over_time = total_time - work_time
+                        over_time_sum = over_time_sum + over_time
 
         logger.info("累計稼働時間・総残業時間計算完了")
         
@@ -276,6 +307,83 @@ def calc_ZangyoTime(s3_client, userID):
     except Exception as e:
         return "エラーが発生しました : " + str(e)
 
+# ===========================
+#  稼働時間計算
+# ===========================
+# (I)time_date   (datetime)  : 追加更新日付
+# (I)taikin_time (string)    : 退勤時間
+# (I)time_res_setting (dict) : 休憩設定ファイル
+# (I)setting     (dict)      : 設定ファイル
+# (O)kadou_calc  (dict)      : 稼働時間
+# ===========================
+def kadou_time_calc(time_date, taikin_time, time_res_setting, setting):
+    # ログレベル設定
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+
+    try:
+        logger.info('kadou_time_calc')
+        total_res = datetime.datetime.strptime("00:00", '%H:%M')
+        taikin_time_date = datetime.datetime.strptime(taikin_time, '%H:%M')
+
+        # 定時就業時間
+        work_time = datetime.datetime.strptime(setting['work_time'], '%H:%M')
+
+        # 始業時間
+        shigyo_time = datetime.datetime.strptime(setting['start_time'], '%H:%M')
+
+        # 退勤時間から総休憩時間を計算
+        logger.info('clac kadou time')
+
+        for time_res in time_res_setting.values():
+            time_res_s_date = datetime.datetime.strptime(time_res['res_s'], '%H:%M')
+            time_res_e_date = datetime.datetime.strptime(time_res['res_e'], '%H:%M')
+            # 休憩時間中の退勤時間は休憩時間を引かない
+            if taikin_time_date > time_res_s_date and taikin_time_date >= time_res_e_date:
+                res_time_delta = time_res_e_date - time_res_s_date
+                total_res = total_res + res_time_delta
+                logger.info('res total (over)-> ' + total_res.strftime('%H:%M'))
+            # 休憩時間中の退勤時 -> 休憩終了時間 - 退勤時間を休憩時間とする
+            elif taikin_time_date > time_res_s_date and taikin_time_date < time_res_e_date:
+                res_time_delta = time_res_e_date - taikin_time_date
+                total_res = total_res + res_time_delta
+                logger.info('res total (in)-> ' + total_res.strftime('%H:%M'))
+
+        # 稼働時間計算（退勤時間 - 始業時間）
+        kadou_time_delta = taikin_time_date - shigyo_time
+
+        # 休憩時間をtimedelta型へ変換
+        total_res_delta = total_res - datetime.datetime.strptime("00:00", '%H:%M')
+
+        # 総稼働時間を計算（timedelta型 -> 秒数 -> int型）
+        kadou_time = int(kadou_time_delta.total_seconds() - total_res_delta.total_seconds())
+
+        # 総稼働時間を計算（秒数 -> 時間:分）
+        kadou_time_hour, remainder = divmod(kadou_time, 3600)
+        kadou_time_min, sec = divmod(remainder, 60)
+        kadou_time_time = datetime.time(hour = kadou_time_hour, minute = kadou_time_min)
+
+        #定時時間より計算時間が小さかったら定時時間にする（同時間かつ分が定時に満たない場合 ※半休考慮）
+        if kadou_time_hour == work_time.hour and kadou_time_min <= work_time.minute:
+            kadou_time_time = work_time
+
+        kadou_total = kadou_time_time.strftime('%H:%M')
+
+        # 退勤時間dict作成
+        add_body = {
+            time_date.strftime('%Y-%m-%d'):
+                {
+                    "TaikinTime": taikin_time,
+                    "TotalTime": kadou_total
+                }
+        }
+        logger.info(str(add_body))
+        logger.info(type(add_body))
+        return add_body
+    
+    except Exception as e:
+        logger.info("エラーが発生しました : " + str(e))
+        return 9
 
 # ---------------------------
 #  ファイル存在チェック
@@ -468,9 +576,9 @@ def reply_template(intNum):
                                         data='kadou_nissu'
                                     )
                                     , PostbackAction(
-                                        label='なにもしない',
-                                        display_text='なにもしない',
-                                        data='done'
+                                        label='可能稼働時間ちぇっく',
+                                        display_text='可能稼働時間ちぇっく',
+                                        data='のこり'
                                     )
                                 ]
                             )
@@ -548,6 +656,9 @@ def lambda_handler(event, context):
 
         logger.info("normal_mode")
 
+        # 現時間取得
+        dt_now = datetime.datetime.utcnow() + datetime.timedelta(hours=DIFF_JST_FROM_UTC)
+
         # たいきん登録
         if message in GO_HOME:
             # S3バケット内にユーザーファイルが存在するかチェック
@@ -556,9 +667,6 @@ def lambda_handler(event, context):
             # ユーザーファイル無 -> ファイル新規作成
             if check_file_result == False:
                 make_new_file(s3_client, userID, 1)
-
-            # 現時間取得
-            dt_now = datetime.datetime.utcnow() + datetime.timedelta(hours=DIFF_JST_FROM_UTC)
 
             # ユーザーファイル編集
             reply = edit_userFile(userID, dt_now)
@@ -581,12 +689,6 @@ def lambda_handler(event, context):
             reply = get_list(userID)
             send_line(userID, reply, reply_token)
             return 0
-        
-        # 残り残業時間
-        elif message == "のこり":
-            reply = calc_ZangyoTime(s3_client, userID)
-            send_line(userID, reply, reply_token)
-            return 0
 
         # その他モード（Postbackメッセージ送信）
         elif message in ETC_MESSAGE:
@@ -603,6 +705,12 @@ def lambda_handler(event, context):
         # 稼働日数修正
         elif message[:4] == "稼働日数":
             reply = fix_setting(s3_client, userID, message, 2)
+            send_line(userID, reply, reply_token)
+            return 0
+        
+        # 退勤時間修正
+        elif message[:4] == "退勤修正":
+            reply = fix_taikinTime(s3_client, userID, message, dt_now)
             send_line(userID, reply, reply_token)
             return 0
         
@@ -669,6 +777,12 @@ def lambda_handler(event, context):
             reply = "👇🏻のように、頭に「稼働日数」をつけて、稼働日数を教えてね！\n"
             reply = reply + "稼働日数20"
             send_line(userID, reply, reply_token)
+
+        # --- 残り残業時間 ---
+        elif message == "のこり":
+            reply = calc_ZangyoTime(s3_client, userID)
+            send_line(userID, reply, reply_token)
+            return 0
         
     handler.handle(body, signature)
     return 0
